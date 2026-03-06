@@ -1,0 +1,8 @@
+output/
+credentials/credentials.json
+credentials/token.json
+.env
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
