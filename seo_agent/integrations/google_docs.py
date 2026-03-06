@@ -12,6 +12,7 @@ load_dotenv()
 # Google API クライアントライブラリ
 try:
     from google.oauth2.credentials import Credentials
+    from google.oauth2 import service_account
     from google.auth.transport.requests import Request
     from google_auth_oauthlib.flow import InstalledAppFlow
     from googleapiclient.discovery import build
@@ -42,37 +43,94 @@ class GoogleDocsClient:
 
     def is_configured(self) -> bool:
         """Google認証情報が設定されているか確認する。"""
-        return GOOGLE_AVAILABLE and Path(self.credentials_path).exists()
+        if not GOOGLE_AVAILABLE:
+            return False
+        # サービスアカウントJSON または OAuth token.json のどちらかがあればOK
+        sa_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
+        if sa_json and Path(sa_json).exists():
+            return True
+        if Path(TOKEN_PATH).exists():
+            return True
+        return False
+
+    def auth_method(self) -> str:
+        """現在の認証方式を返す。'service_account' | 'oauth' | 'none'"""
+        if not GOOGLE_AVAILABLE:
+            return "none"
+        sa_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
+        if sa_json and Path(sa_json).exists():
+            return "service_account"
+        if Path(TOKEN_PATH).exists():
+            return "oauth"
+        return "none"
 
     def authenticate(self) -> bool:
-        """OAuth認証を実行する。初回はブラウザが開く。"""
+        """
+        Google認証を実行する。
+
+        優先順位:
+        1. GOOGLE_SERVICE_ACCOUNT_JSON 環境変数 → サービスアカウント認証（iPhone対応）
+        2. credentials/token.json が存在 → OAuthトークンをリフレッシュ
+        3. どちらもなし → RuntimeError
+        """
+        if not GOOGLE_AVAILABLE:
+            raise RuntimeError("google-api-python-client がインストールされていません。")
+
+        creds = None
+
+        # 1. サービスアカウント認証（iPhoneなど外部端末からでも動作する）
+        sa_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
+        if sa_json and Path(sa_json).exists():
+            creds = service_account.Credentials.from_service_account_file(
+                sa_json, scopes=SCOPES
+            )
+            self._creds = creds
+            self._docs_service = build("docs", "v1", credentials=creds)
+            self._drive_service = build("drive", "v3", credentials=creds)
+            return True
+
+        # 2. 既存OAuthトークンのリフレッシュ（デスクトップで事前認証済みの場合）
+        if Path(TOKEN_PATH).exists():
+            creds = Credentials.from_authorized_user_file(TOKEN_PATH, SCOPES)
+            if creds.expired and creds.refresh_token:
+                creds.refresh(Request())
+                with open(TOKEN_PATH, "w") as f:
+                    f.write(creds.to_json())
+            if creds.valid:
+                self._creds = creds
+                self._docs_service = build("docs", "v1", credentials=creds)
+                self._drive_service = build("drive", "v3", credentials=creds)
+                return True
+
+        raise RuntimeError(
+            "Google認証情報が設定されていません。\n\n"
+            "【推奨】サービスアカウントを使用（iPhoneからも動作）:\n"
+            "  1. GCP Console でサービスアカウントを作成\n"
+            "  2. JSONキーをダウンロードして credentials/service-account.json に配置\n"
+            "  3. .env に GOOGLE_SERVICE_ACCOUNT_JSON=credentials/service-account.json を追加\n\n"
+            "【代替】デスクトップで事前認証（token.json を生成する）:\n"
+            "  python -c \"from seo_agent.integrations.google_docs import GoogleDocsClient; "
+            "GoogleDocsClient().run_desktop_auth()\""
+        )
+
+    def run_desktop_auth(self) -> bool:
+        """
+        デスクトップ環境でのOAuth認証（事前セットアップ用）。
+        一度実行すると credentials/token.json が生成され、以降はサーバーでも使える。
+        iPhoneからは実行不可。PC/Mac で一度だけ実行する。
+        """
         if not GOOGLE_AVAILABLE:
             raise RuntimeError("google-api-python-client がインストールされていません。")
         if not Path(self.credentials_path).exists():
             raise FileNotFoundError(
-                f"Google認証情報が見つかりません: {self.credentials_path}\n"
-                "Google Cloud Consoleから credentials.json をダウンロードして配置してください。"
+                f"OAuth credentials.json が見つかりません: {self.credentials_path}"
             )
-
-        creds = None
-        if Path(TOKEN_PATH).exists():
-            creds = Credentials.from_authorized_user_file(TOKEN_PATH, SCOPES)
-
-        if not creds or not creds.valid:
-            if creds and creds.expired and creds.refresh_token:
-                creds.refresh(Request())
-            else:
-                flow = InstalledAppFlow.from_client_secrets_file(
-                    self.credentials_path, SCOPES
-                )
-                creds = flow.run_local_server(port=0)
-            Path(TOKEN_PATH).parent.mkdir(parents=True, exist_ok=True)
-            with open(TOKEN_PATH, "w") as f:
-                f.write(creds.to_json())
-
-        self._creds = creds
-        self._docs_service = build("docs", "v1", credentials=creds)
-        self._drive_service = build("drive", "v3", credentials=creds)
+        flow = InstalledAppFlow.from_client_secrets_file(self.credentials_path, SCOPES)
+        creds = flow.run_local_server(port=0)
+        Path(TOKEN_PATH).parent.mkdir(parents=True, exist_ok=True)
+        with open(TOKEN_PATH, "w") as f:
+            f.write(creds.to_json())
+        print(f"✓ 認証完了。{TOKEN_PATH} に保存しました。")
         return True
 
     def _ensure_authenticated(self) -> None:
@@ -124,6 +182,17 @@ class GoogleDocsClient:
             body={"title": plan.meta_title}
         ).execute()
         doc_id = doc["documentId"]
+
+        # ユーザーのGoogleアカウントへ共有（サービスアカウント使用時に必要）
+        user_email = os.getenv("USER_GOOGLE_EMAIL")
+        if user_email:
+            try:
+                self._drive_service.permissions().create(
+                    fileId=doc_id,
+                    body={"type": "user", "role": "writer", "emailAddress": user_email},
+                ).execute()
+            except Exception as e:
+                print(f"[GoogleDocsClient] 共有設定エラー（無視して続行）: {e}")
 
         # 図解画像をDriveにアップロード
         image_urls: dict[str, str] = {}

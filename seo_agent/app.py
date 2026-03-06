@@ -56,36 +56,34 @@ def render_sidebar() -> tuple[str, str]:
     creds_path = os.getenv(
         "GOOGLE_CREDENTIALS_PATH", "credentials/credentials.json"
     )
-    creds_exists = Path(creds_path).exists()
 
-    if creds_exists:
-        st.sidebar.success("✓ credentials.json が見つかりました")
-        if st.sidebar.button("Google認証を実行"):
-            try:
-                from integrations.google_docs import GoogleDocsClient
-                client = GoogleDocsClient(credentials_path=creds_path)
-                client.authenticate()
-                st.session_state.google_authenticated = True
-                st.sidebar.success("✓ Google認証完了！")
-            except Exception as e:
-                st.sidebar.error(f"認証エラー: {e}")
+    # 認証状態を確認
+    sa_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "")
+    sa_exists = bool(sa_json) and Path(sa_json).exists()
+    token_exists = Path("credentials/token.json").exists()
+
+    if sa_exists:
+        st.sidebar.success("✓ サービスアカウント認証済み（iPhone対応）")
+    elif token_exists:
+        st.sidebar.success("✓ OAuth認証済み（token.json）")
     else:
         st.sidebar.warning(
-            "credentials.json が見つかりません。\n\n"
-            "Google Cloud Console から OAuth 2.0クライアントIDをダウンロードして "
-            f"`{creds_path}` に配置してください。"
+            "Google認証が設定されていません。\n\n"
+            "**【推奨】サービスアカウント設定（iPhoneからも動作）:**\n"
+            "1. GCP Console でサービスアカウントを作成\n"
+            "2. JSONキーを `credentials/service-account.json` に配置\n"
+            "3. `.env` に以下を追加:\n"
+            "   `GOOGLE_SERVICE_ACCOUNT_JSON=credentials/service-account.json`\n"
+            "   `USER_GOOGLE_EMAIL=your@gmail.com`"
         )
-
-    if st.session_state.google_authenticated or Path("credentials/token.json").exists():
-        st.sidebar.success("✓ Google認証済み")
 
     st.sidebar.markdown("---")
     st.sidebar.markdown(
         "**使い方**\n"
-        "1. APIキーを入力\n"
-        "2. Google認証を実行\n"
-        "3. トピックを入力して生成\n"
-        "4. Google DocsのリンクからURLにアクセス"
+        "1. Anthropic API Keyを入力\n"
+        "2. Google認証を設定（.envファイル）\n"
+        "3. トピックを入力して記事を生成\n"
+        "4. Google DocsのURLにアクセス"
     )
 
     return api_key, creds_path
@@ -317,10 +315,10 @@ def main() -> None:
     with tab3:
         render_results_tab()
 
-    # 生成中は自動更新
+    # 生成中は自動更新（モバイル回線を考慮して3秒間隔）
     if st.session_state.generating:
         import time
-        time.sleep(2)
+        time.sleep(3)
         st.rerun()
 
 
